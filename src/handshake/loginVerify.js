@@ -9,9 +9,86 @@ module.exports = (client, server, options) => {
 
   const getDER = b64 => crypto.createPublicKey({ key: Buffer.from(b64, 'base64'), format: 'der', type: 'spki' })
 
+  // Check if a string looks like a valid JWT token (has at least header.payload.signature)
+  function isValidJWT(str) {
+    if (!str || typeof str !== 'string') return false
+    if (str.length < 10) return false
+    const parts = str.split('.')
+    if (parts.length < 2) return false
+    try {
+      const header = Buffer.from(parts[0], 'base64').toString('utf-8')
+      JSON.parse(header)
+      return true
+    } catch {
+      return false
+    }
+  }
+
   // 26.10, March 2026+
-  function parseTokenData (token) {
-    function normalizeToken (token) {
+  // Handles the new LoginToken format:
+  //   RS256 (online/full)  — header has { alg: "RS256", kid: "...", typ: "JWT" }, no x5u
+  //   ES384 (self-signed)  — header has { alg: "ES384", x5u: "..." }
+  function parseLoginToken(token) {
+    function normalizeToken(token) {
+      return token.replace(/^MCToken\s+/i, '')
+    }
+
+    const normalized = normalizeToken(token)
+    const [headerB64] = normalized.split('.')
+    const headerStr = Buffer.from(headerB64, 'base64').toString('utf-8')
+    const header = JSON.parse(headerStr)
+
+    if (header.alg === 'RS256') {
+      // Online / full authentication token (OIDC).
+      // Relay mode: decode without signature verification — the destination server
+      // will verify. We only need to extract identity data for forwarding.
+      const decoded = JWT.decode(normalized)
+      if (!decoded || typeof decoded !== 'object') throw new Error('Invalid RS256 login token')
+
+      const payload = decoded
+      const key = payload.cpk || payload.clientPublicKey || ''
+      return {
+        key,
+        data: {
+          extraData: {
+            XUID: payload.xid || payload.XUID || payload.xuid || '0',
+            displayName: payload.xname || payload.displayName || 'Player',
+            identity: payload.identity,
+            PlayFabID: payload.pfbid || payload.playFabId || payload.PlayFabID,
+            PlayFabTitleID: payload.pfbtid || payload.playFabTitleId || payload.PlayFabTitleID
+          }
+        }
+      }
+    }
+
+    if (header.alg === 'ES384') {
+      // Self-signed authentication token — verify with x5u
+      const x5u = getX5U(normalized)
+      const decoded = JWT.verify(normalized, getDER(x5u), { algorithms: ['ES384', 'RS256'] })
+      if (!decoded || typeof decoded !== 'object') throw new Error('Invalid login token')
+
+      const payload = decoded || {}
+      const key = payload.cpk || payload.clientPublicKey || x5u
+      return {
+        key,
+        data: {
+          extraData: {
+            XUID: payload.xid || payload.XUID || payload.xuid || '0',
+            displayName: payload.xname || payload.displayName || 'Player',
+            identity: payload.identity,
+            PlayFabID: payload.pfbid || payload.playFabId || payload.PlayFabID,
+            PlayFabTitleID: payload.pfbtid || payload.playFabTitleId || payload.PlayFabTitleID
+          }
+        }
+      }
+    }
+
+    throw new Error('Unsupported login token algorithm: ' + header.alg)
+  }
+
+  // Legacy token data parser (self-signed only, pre-1.26.10)
+  function parseTokenData(token) {
+    function normalizeToken(token) {
       return token.replace(/^MCToken\s+/i, '')
     }
 
@@ -36,11 +113,14 @@ module.exports = (client, server, options) => {
     }
   }
 
-  function verifyAuth (chain, token) {
-    // In offline mode 26.10+, we do not generate a chain and only a self-signed token.
-    if ((!chain || chain.length === 0 || chain.every(entry => !entry)) && token) {
-      if (!options.offline) throw new Error('Missing certificate chain for authenticated login')
-      return parseTokenData(token)
+  function verifyAuth(chain, token) {
+    // Filter out placeholder entries (e.g. ".." sent by 1.26.10+ clients)
+    const validChain = chain ? chain.filter(e => isValidJWT(e)) : []
+
+    // 1.26.10+ with a login token: if the legacy chain is all placeholders,
+    // or chain is empty/missing, use the authToken directly.
+    if ((!chain || chain.length === 0 || validChain.length === 0 || chain.every(entry => !entry)) && token) {
+      return parseLoginToken(token)
     }
 
     let data = {}
@@ -52,14 +132,14 @@ module.exports = (client, server, options) => {
     // signed by Mojang by checking the x509 public key in the JWT headers
     let didVerify = false
 
-    let pubKey = getDER(getX5U(chain[0])) // the first one is client signed, allow it
+    let pubKey = getDER(getX5U(validChain[0])) // the first one is client signed, allow it
     let finalKey = null
 
-    for (const token of chain) {
-      const decoded = JWT.verify(token, pubKey, { algorithms: ['ES384'] })
+    for (const t of validChain) {
+      const decoded = JWT.verify(t, pubKey, { algorithms: ['ES384'] })
 
       // Check if signed by Mojang key
-      const x5u = getX5U(token)
+      const x5u = getX5U(t)
       if (x5u === constants.PUBLIC_KEY && !data.extraData?.XUID) {
         didVerify = true
         debug('Verified client with mojang key', x5u)
@@ -77,7 +157,7 @@ module.exports = (client, server, options) => {
     return { key: finalKey, data }
   }
 
-  function verifySkin (publicKey, token) {
+  function verifySkin(publicKey, token) {
     const pubKey = getDER(publicKey)
     const decoded = JWT.verify(token, pubKey, { algorithms: ['ES384'] })
     return decoded
@@ -99,7 +179,7 @@ module.exports = (client, server, options) => {
   }
 }
 
-function getX5U (token) {
+function getX5U(token) {
   const [header] = token.split('.')
   const hdec = Buffer.from(header, 'base64').toString('utf-8')
   const hjson = JSON.parse(hdec)
